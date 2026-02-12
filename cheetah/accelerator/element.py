@@ -10,10 +10,10 @@ from torch import nn
 from cheetah.particles import Beam, ParameterBeam, ParticleBeam, Species
 from cheetah.utils import DirtyNameWarning, NoVisualizationWarning, UniqueNameGenerator
 from cheetah.utils.warnings import PhysicsWarning
+from cheetah.utils.physics import compute_relativistic_factors
+from scipy.constants import physical_constants, pi 
 
 generate_unique_name = UniqueNameGenerator(prefix="unnamed_element")
-
-
 class Element(ABC, nn.Module):
     """
     Base class for elements of particle accelerators.
@@ -49,11 +49,102 @@ class Element(ABC, nn.Module):
                     stacklevel=2,
                 )
 
+        # All elements have a length
         self.register_buffer("length", torch.tensor(0.0, device=device, dtype=dtype))
 
         if not hasattr(self, "supported_tracking_methods"):
             self.supported_tracking_methods = [self.__class__.__name__.lower()]
         self._tracking_method = self.supported_tracking_methods[0]
+
+    # ------------------------------------------------------------------
+    # Space-charge half kick (generic for all elements)
+    # ------------------------------------------------------------------
+    def _sc_kick_half_matrix(
+        self, energy: torch.Tensor, species: Species
+    ) -> torch.Tensor:
+        """
+        Linearized space-charge half-kick matrix (KV / rms envelope model).
+
+        This method is intentionally placed in Element so that it can be used
+        by Drift, Quadrupole, and any future elements.
+        """
+
+        # SC disabled → identity
+        if not getattr(self, "enable_sc_kick", False):
+            vec_shape = torch.broadcast_shapes(self.length.shape, energy.shape)
+            return torch.eye(
+                7, device=self.length.device, dtype=self.length.dtype
+            ).repeat(*vec_shape, 1, 1)
+
+        # Zero current → no SC
+        if torch.any(self.curr == 0):
+            vec_shape = torch.broadcast_shapes(self.length.shape, energy.shape)
+            return torch.eye(
+                7, device=self.length.device, dtype=self.length.dtype
+            ).repeat(*vec_shape, 1, 1)
+
+        # Sanity checks
+        if torch.any(self.x_s <= 0) or torch.any(self.y_s <= 0):
+            raise ValueError("x_s and y_s must be > 0 for SC kick.")
+
+        # Relativistic factors (energy and mass in eV)
+        gamma, igamma2, beta = compute_relativistic_factors(
+            energy, species.mass_eV
+        )
+
+        # ---- physical constants (SI) ----
+        c = torch.as_tensor(
+            physical_constants["speed of light in vacuum"][0],
+            device=self.length.device,
+            dtype=self.length.dtype,
+        )
+        eps0 = torch.as_tensor(
+            physical_constants["electric constant"][0],
+            device=self.length.device,
+            dtype=self.length.dtype,
+        )
+        e_charge = torch.as_tensor(
+            physical_constants["elementary charge"][0],
+            device=self.length.device,
+            dtype=self.length.dtype,
+        )
+        pi = torch.as_tensor(
+            torch.pi, device=self.length.device, dtype=self.length.dtype
+        )
+
+        # Particle charge [C]
+        q = e_charge
+        # Particle mass [kg]  (mass_eV → J → kg)
+        m_eV = torch.as_tensor(
+            species.mass_eV, device=self.length.device, dtype=self.length.dtype
+        )
+        mass_kg = (m_eV * e_charge) / (c**2)
+
+        # Generalized perveance
+        # K = q I / (pi eps0 m (c beta gamma)^3)
+        perv = q * self.curr / (
+            pi * eps0 * mass_kg * (c * beta * gamma) ** 3
+        )
+
+        # Build half-kick matrix
+        vec_shape = torch.broadcast_shapes(
+            self.length.shape, perv.shape, self.x_s.shape, self.y_s.shape
+        )
+
+        K_half = torch.eye(
+            7, device=self.length.device, dtype=self.length.dtype
+        ).repeat(*vec_shape, 1, 1)
+
+        Lh = 0.5 * self.length
+        sum_xy = self.x_s + self.y_s
+
+        # Envelope-linearized SC focusing
+        K_half[..., 1, 0] = Lh * perv / self.x_s / sum_xy / 4.0
+        K_half[..., 3, 2] = Lh * perv / self.y_s / sum_xy / 4.0
+
+        return K_half
+
+
 
     def transfer_map(self, energy: torch.Tensor, species: Species) -> torch.Tensor:
         r"""

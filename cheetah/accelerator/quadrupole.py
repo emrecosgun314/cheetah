@@ -18,27 +18,13 @@ from cheetah.utils import (
     squash_index_for_unavailable_dims,
 )
 
+from cheetah.utils.physics import compute_relativistic_factors
+from scipy.constants import physical_constants, pi 
+
 generate_unique_name = UniqueNameGenerator(prefix="unnamed_element")
 
 
 class Quadrupole(Element):
-    """
-    Quadrupole magnet in a particle accelerator.
-
-    :param length: Length in meters.
-    :param k1: Strength of the quadrupole in 1/m^-2.
-    :param misalignment: Misalignment vector of the quadrupole in x- and y-directions.
-    :param tilt: Tilt angle of the quadrupole in x-y plane in radians. pi/4 for
-        skew-quadrupole.
-    :param num_steps: Number of drift-kick-drift steps to use for tracking through the
-        element when tracking method is set to `"drift_kick_drift"`.
-    :param tracking_method: Method to use for tracking through the element.
-    :param name: Unique identifier of the element.
-    :param sanitize_name: Whether to sanitise the name to be a valid Python variable
-        name. This is needed if you want to use the `segment.element_name` syntax to
-        access the element in a segment.
-    """
-
     supported_tracking_methods = ["linear", "second_order", "drift_kick_drift"]
 
     def __init__(
@@ -48,13 +34,16 @@ class Quadrupole(Element):
         misalignment: torch.Tensor | None = None,
         tilt: torch.Tensor | None = None,
         num_steps: int = 1,
-        tracking_method: Literal[
-            "linear", "second_order", "drift_kick_drift"
-        ] = "linear",
+        tracking_method: Literal["linear", "second_order", "drift_kick_drift"] = "linear",
         name: str | None = None,
         sanitize_name: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        # --- SC kick ---
+        enable_sc_kick: bool = False,
+        curr: torch.Tensor | None = None,  # [A]
+        x_s: torch.Tensor | None = None,   # [m]
+        y_s: torch.Tensor | None = None,   # [m]
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(name=name, sanitize_name=sanitize_name, **factory_kwargs)
@@ -66,23 +55,86 @@ class Quadrupole(Element):
         )
         self.register_buffer_or_parameter(
             "misalignment",
-            (
-                misalignment
-                if misalignment is not None
-                else torch.tensor((0.0, 0.0), **factory_kwargs)
-            ),
+            misalignment if misalignment is not None else torch.tensor((0.0, 0.0), **factory_kwargs),
         )
         self.register_buffer_or_parameter(
             "tilt", tilt if tilt is not None else torch.tensor(0.0, **factory_kwargs)
         )
 
+        # --- SC params (stored as tensors, never None after init) ---
+        self.register_buffer_or_parameter(
+            "curr", curr if curr is not None else torch.tensor(0.0, **factory_kwargs)
+        )
+        self.register_buffer_or_parameter(
+            "x_s", x_s if x_s is not None else torch.tensor(0.0, **factory_kwargs)
+        )
+        self.register_buffer_or_parameter(
+            "y_s", y_s if y_s is not None else torch.tensor(0.0, **factory_kwargs)
+        )
+        self.enable_sc_kick = enable_sc_kick
+
         self.num_steps = num_steps
         self.tracking_method = tracking_method
 
+    def _sc_kick_half_matrix(self, energy: torch.Tensor, species: Species) -> torch.Tensor:
+        """Linearized space-charge half-kick matrix (KV / rms envelope model)."""
+
+        # Disabled -> identity
+        if not self.enable_sc_kick:
+            vec_shape = torch.broadcast_shapes(self.length.shape, energy.shape)
+            return torch.eye(7, device=self.length.device, dtype=self.length.dtype).repeat(
+                *vec_shape, 1, 1
+            )
+
+        # Since curr/x_s/y_s are always tensors, check values
+        if torch.any(self.curr == 0):
+            # No current -> no SC
+            vec_shape = torch.broadcast_shapes(self.length.shape, energy.shape)
+            return torch.eye(7, device=self.length.device, dtype=self.length.dtype).repeat(
+                *vec_shape, 1, 1
+            )
+        if torch.any(self.x_s <= 0) or torch.any(self.y_s <= 0):
+            raise ValueError("x_s and y_s must be > 0 for SC kick.")
+
+        # Relativistic factors
+        gamma, igamma2, beta = compute_relativistic_factors(energy, species.mass_eV)
+
+        # physical constants (SI) -> tensors
+        c_val = physical_constants["speed of light in vacuum"][0]
+        eps0_val = physical_constants["electric constant"][0]
+        e_val = physical_constants["elementary charge"][0]
+
+        c = torch.as_tensor(c_val, device=self.length.device, dtype=self.length.dtype)
+        eps0 = torch.as_tensor(eps0_val, device=self.length.device, dtype=self.length.dtype)
+        e_charge = torch.as_tensor(e_val, device=self.length.device, dtype=self.length.dtype)
+        pi = torch.as_tensor(torch.pi, device=self.length.device, dtype=self.length.dtype)
+
+        # Charge [C] (assumes Species has charge_state)
+        q = e_charge
+
+        # Mass [kg] from mass_eV
+        m_eV = torch.as_tensor(species.mass_eV, device=self.length.device, dtype=self.length.dtype)
+        mass_kg = (m_eV * e_charge) / (c**2)
+
+        # Perveance: K = q I / (pi eps0 m (c beta gamma)^3)
+        perv = q * self.curr / (pi * eps0 * mass_kg * (c * beta * gamma) ** 3)
+
+        vec_shape = torch.broadcast_shapes(self.length.shape, perv.shape, self.x_s.shape, self.y_s.shape)
+        K_half = torch.eye(7, device=self.length.device, dtype=self.length.dtype).repeat(
+            *vec_shape, 1, 1
+        )
+
+        Lh = 0.5 * self.length
+        sum_xy = self.x_s + self.y_s
+
+        # Same coefficients as old Quadrupole_sc
+        K_half[..., 1, 0] = Lh * perv / self.x_s / sum_xy / 4.0
+        K_half[..., 3, 2] = Lh * perv / self.y_s / sum_xy / 4.0
+
+        return K_half
+
     @cache_transfer_map
-    def first_order_transfer_map(
-        self, energy: torch.Tensor, species: Species
-    ) -> torch.Tensor:
+    def first_order_transfer_map(self, energy: torch.Tensor, species: Species) -> torch.Tensor:
         R = base_rmatrix(
             length=self.length,
             k1=self.k1,
@@ -91,12 +143,17 @@ class Quadrupole(Element):
             energy=energy,
         )
 
+        # SC: K_half @ R @ K_half
+        K_half = self._sc_kick_half_matrix(energy, species)
+        R = K_half @ R @ K_half
+
+        # rotation + misalignment
         R_entry, R_exit = combined_rotation_misalignment_matrix(
             angle=self.tilt, misalignment=self.misalignment
         )
-        R = R_exit @ R @ R_entry
+        return R_exit @ R @ R_entry
 
-        return R
+
 
     @cache_transfer_map
     def second_order_transfer_map(
@@ -325,5 +382,5 @@ class Quadrupole(Element):
             "k1",
             "misalignment",
             "tilt",
-            "num_steps",
+            "num_steps", "curr", "x_s", "y_s", "enable_sc_kick"
         ]

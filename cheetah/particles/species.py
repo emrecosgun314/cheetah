@@ -5,6 +5,7 @@ from torch import nn
 electron_mass_eV = physical_constants["electron mass energy equivalent in MeV"][0] * 1e6
 proton_mass_eV = physical_constants["proton mass energy equivalent in MeV"][0] * 1e6
 deuteron_mass_eV = physical_constants["deuteron mass energy equivalent in MeV"][0] * 1e6
+muon_mass_eV = physical_constants["muon mass energy equivalent in MeV"][0] * 1e6
 elementary_charge = physical_constants["elementary charge"][0]
 eV_to_kg = physical_constants["electron volt-kilogram relationship"][0]
 
@@ -33,6 +34,12 @@ class Species(nn.Module):
         "proton": {"num_elementary_charges": 1, "mass_eV": proton_mass_eV},
         "antiproton": {"num_elementary_charges": -1, "mass_eV": proton_mass_eV},
         "deuteron": {"num_elementary_charges": 1, "mass_eV": deuteron_mass_eV},
+        
+        # ---- Muons (added) ----
+        "mu+":          {"num_elementary_charges":  1, "mass_eV": muon_mass_eV},
+        "mu-":          {"num_elementary_charges": -1, "mass_eV": muon_mass_eV},
+        "muon+":        {"num_elementary_charges":  1, "mass_eV": muon_mass_eV},
+        "muon-":        {"num_elementary_charges": -1, "mass_eV": muon_mass_eV},
     }
 
     def __init__(

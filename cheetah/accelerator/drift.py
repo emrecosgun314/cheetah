@@ -7,20 +7,14 @@ from cheetah.accelerator.element import Element
 from cheetah.particles import Beam, ParticleBeam, Species
 from cheetah.track_methods import base_ttensor, drift_matrix
 from cheetah.utils import UniqueNameGenerator, bmadx, cache_transfer_map
-
+from cheetah.utils.physics import compute_relativistic_factors
+from scipy.constants import physical_constants, pi 
 generate_unique_name = UniqueNameGenerator(prefix="unnamed_element")
 
 
 class Drift(Element):
     """
     Drift section in a particle accelerator.
-
-    :param length: Length in meters.
-    :param tracking_method: Method to use for tracking through the element.
-    :param name: Unique identifier of the element.
-    :param sanitize_name: Whether to sanitise the name to be a valid Python variable
-        name. This is needed if you want to use the `segment.element_name` syntax to
-        access the element in a segment.
     """
 
     supported_tracking_methods = ["linear", "second_order", "drift_kick_drift"]
@@ -28,26 +22,55 @@ class Drift(Element):
     def __init__(
         self,
         length: torch.Tensor,
-        tracking_method: Literal[
-            "linear", "second_order", "drift_kick_drift"
-        ] = "linear",
+        tracking_method: Literal["linear", "second_order", "drift_kick_drift"] = "linear",
         name: str | None = None,
         sanitize_name: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        # --- SC kick ---
+        enable_sc_kick: bool = False,
+        curr: torch.Tensor | None = None,   # [A]
+        x_s: torch.Tensor | None = None,    # [m]
+        y_s: torch.Tensor | None = None,    # [m]
     ) -> None:
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(name=name, sanitize_name=sanitize_name, **factory_kwargs)
 
         self.length = length
-
         self.tracking_method = tracking_method
 
+        # --- SC parameters ---
+        self.register_buffer_or_parameter(
+            "curr", curr if curr is not None else torch.tensor(0.0, **factory_kwargs)
+        )
+        self.register_buffer_or_parameter(
+            "x_s", x_s if x_s is not None else torch.tensor(0.0, **factory_kwargs)
+        )
+        self.register_buffer_or_parameter(
+            "y_s", y_s if y_s is not None else torch.tensor(0.0, **factory_kwargs)
+        )
+        self.enable_sc_kick = enable_sc_kick
+
+    # ------------------------------------------------------------------
+    # First-order map
+    # ------------------------------------------------------------------
     @cache_transfer_map
     def first_order_transfer_map(
         self, energy: torch.Tensor, species: Species
     ) -> torch.Tensor:
-        return drift_matrix(length=self.length, energy=energy, species=species)
+
+        R = drift_matrix(
+            length=self.length,
+            energy=energy,
+            species=species,
+        )
+
+        if self.enable_sc_kick:
+            K_half = self._sc_kick_half_matrix(energy, species)
+            R = K_half @ R @ K_half
+
+        return R
+
 
     @cache_transfer_map
     def second_order_transfer_map(
@@ -180,4 +203,6 @@ class Drift(Element):
 
     @property
     def defining_features(self) -> list[str]:
-        return super().defining_features + ["length"]
+        return super().defining_features + [
+            "length", "curr", "x_s", "y_s", "enable_sc_kick"
+        ]
