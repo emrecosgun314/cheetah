@@ -12,6 +12,9 @@
 
 ### 🐆 Other
 
+- The copyright years were updated to 2026 (see #608) (@jank324)
+- Fix format issue caused by new `black` version (see #611) (@jank324)
+
 ### 🌟 First Time Contributors
 
 ## [v0.8.0](https://github.com/desy-ml/cheetah/releases/tag/v0.8.0) (2025-12-03)
