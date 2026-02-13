@@ -39,7 +39,6 @@ class Quadrupole(Element):
         sanitize_name: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-        # --- SC kick ---
         enable_sc_kick: bool = False,
         curr: torch.Tensor | None = None,  # [A]
         x_s: torch.Tensor | None = None,   # [m]
@@ -61,7 +60,6 @@ class Quadrupole(Element):
             "tilt", tilt if tilt is not None else torch.tensor(0.0, **factory_kwargs)
         )
 
-        # --- SC params (stored as tensors, never None after init) ---
         self.register_buffer_or_parameter(
             "curr", curr if curr is not None else torch.tensor(0.0, **factory_kwargs)
         )
@@ -76,63 +74,6 @@ class Quadrupole(Element):
         self.num_steps = num_steps
         self.tracking_method = tracking_method
 
-    def _sc_kick_half_matrix(self, energy: torch.Tensor, species: Species) -> torch.Tensor:
-        """Linearized space-charge half-kick matrix (KV / rms envelope model)."""
-
-        # Disabled -> identity
-        if not self.enable_sc_kick:
-            vec_shape = torch.broadcast_shapes(self.length.shape, energy.shape)
-            return torch.eye(7, device=self.length.device, dtype=self.length.dtype).repeat(
-                *vec_shape, 1, 1
-            )
-
-        # Since curr/x_s/y_s are always tensors, check values
-        if torch.any(self.curr == 0):
-            # No current -> no SC
-            vec_shape = torch.broadcast_shapes(self.length.shape, energy.shape)
-            return torch.eye(7, device=self.length.device, dtype=self.length.dtype).repeat(
-                *vec_shape, 1, 1
-            )
-        if torch.any(self.x_s <= 0) or torch.any(self.y_s <= 0):
-            raise ValueError("x_s and y_s must be > 0 for SC kick.")
-
-        # Relativistic factors
-        gamma, igamma2, beta = compute_relativistic_factors(energy, species.mass_eV)
-
-        # physical constants (SI) -> tensors
-        c_val = physical_constants["speed of light in vacuum"][0]
-        eps0_val = physical_constants["electric constant"][0]
-        e_val = physical_constants["elementary charge"][0]
-
-        c = torch.as_tensor(c_val, device=self.length.device, dtype=self.length.dtype)
-        eps0 = torch.as_tensor(eps0_val, device=self.length.device, dtype=self.length.dtype)
-        e_charge = torch.as_tensor(e_val, device=self.length.device, dtype=self.length.dtype)
-        pi = torch.as_tensor(torch.pi, device=self.length.device, dtype=self.length.dtype)
-
-        # Charge [C] (assumes Species has charge_state)
-        q = e_charge
-
-        # Mass [kg] from mass_eV
-        m_eV = torch.as_tensor(species.mass_eV, device=self.length.device, dtype=self.length.dtype)
-        mass_kg = (m_eV * e_charge) / (c**2)
-
-        # Perveance: K = q I / (pi eps0 m (c beta gamma)^3)
-        perv = q * self.curr / (pi * eps0 * mass_kg * (c * beta * gamma) ** 3)
-
-        vec_shape = torch.broadcast_shapes(self.length.shape, perv.shape, self.x_s.shape, self.y_s.shape)
-        K_half = torch.eye(7, device=self.length.device, dtype=self.length.dtype).repeat(
-            *vec_shape, 1, 1
-        )
-
-        Lh = 0.5 * self.length
-        sum_xy = self.x_s + self.y_s
-
-        # Same coefficients as old Quadrupole_sc
-        K_half[..., 1, 0] = Lh * perv / self.x_s / sum_xy / 4.0
-        K_half[..., 3, 2] = Lh * perv / self.y_s / sum_xy / 4.0
-
-        return K_half
-
     @cache_transfer_map
     def first_order_transfer_map(self, energy: torch.Tensor, species: Species) -> torch.Tensor:
         R = base_rmatrix(
@@ -142,10 +83,10 @@ class Quadrupole(Element):
             species=species,
             energy=energy,
         )
-
-        # SC: K_half @ R @ K_half
-        K_half = self._sc_kick_half_matrix(energy, species)
-        R = K_half @ R @ K_half
+        ## here, SC kick apply
+        if self.enable_sc_kick:
+            K_half = self._sc_kick_half_matrix(energy, species)
+            R = K_half @ R @ K_half
 
         # rotation + misalignment
         R_entry, R_exit = combined_rotation_misalignment_matrix(

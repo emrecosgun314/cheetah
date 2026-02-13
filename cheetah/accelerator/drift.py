@@ -27,7 +27,6 @@ class Drift(Element):
         sanitize_name: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-        # --- SC kick ---
         enable_sc_kick: bool = False,
         curr: torch.Tensor | None = None,   # [A]
         x_s: torch.Tensor | None = None,    # [m]
@@ -39,7 +38,6 @@ class Drift(Element):
         self.length = length
         self.tracking_method = tracking_method
 
-        # --- SC parameters ---
         self.register_buffer_or_parameter(
             "curr", curr if curr is not None else torch.tensor(0.0, **factory_kwargs)
         )
@@ -51,9 +49,6 @@ class Drift(Element):
         )
         self.enable_sc_kick = enable_sc_kick
 
-    # ------------------------------------------------------------------
-    # First-order map
-    # ------------------------------------------------------------------
     @cache_transfer_map
     def first_order_transfer_map(
         self, energy: torch.Tensor, species: Species
@@ -64,7 +59,7 @@ class Drift(Element):
             energy=energy,
             species=species,
         )
-
+        ## here, SC kick apply
         if self.enable_sc_kick:
             K_half = self._sc_kick_half_matrix(energy, species)
             R = K_half @ R @ K_half
